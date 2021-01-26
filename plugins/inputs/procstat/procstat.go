@@ -2,13 +2,18 @@ package procstat
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/elastic/gosigar/sys/linux"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/shirou/gopsutil/process"
@@ -17,6 +22,15 @@ import (
 var (
 	defaultPIDFinder = NewPgrep
 	defaultProcess   = NewProc
+)
+
+const (
+	// MetricNameTCPConnections is the measurement name for TCP connections metrics
+	MetricNameTCPConnections = "procstat_tcp"
+	// TCPConnectionKey is the metric value to put all the listen endpoints
+	TCPConnectionKey = "conn"
+	// TCPListenKey is the metric value to put all the connection endpoints
+	TCPListenKey = "listen"
 )
 
 type PID int32
@@ -34,6 +48,7 @@ type Procstat struct {
 	CGroup      string `toml:"cgroup"`
 	PidTag      bool
 	WinService  string `toml:"win_service"`
+	// TODO añadir la posibildiad de poner un prefix a las IPs, para poder distinguir casos con reutilizadion de subredes. Verificar que en skydive se lo va a comer, aunque no sea una IP válida
 
 	finder PIDFinder
 
@@ -126,13 +141,21 @@ func (p *Procstat) Gather(acc telegraf.Accumulator) error {
 
 	procs, err := p.updateProcesses(pids, tags, p.procs)
 	if err != nil {
-		acc.AddError(fmt.Errorf("E! Error: procstat getting process, exe: [%s] pidfile: [%s] pattern: [%s] user: [%s] %s",
+		acc.AddError(fmt.Errorf("E! [inputs.procstat] getting process, exe: [%s] pidfile: [%s] pattern: [%s] user: [%s] %s",
 			p.Exe, p.PidFile, p.Pattern, p.User, err.Error()))
 	}
 	p.procs = procs
 
+	// Initialize the conn object. Gather info about all TCP connections organized per PID
+	// Avoid repeating this task for each proc
+	netInfo := NetworkInfo{}
+	err = netInfo.Fetch()
+	if err != nil {
+		acc.AddError(fmt.Errorf("E! [inputs.procstat] getting TCP network info: %v", err))
+	}
+
 	for _, proc := range p.procs {
-		p.addMetric(proc, acc)
+		p.addMetric(proc, acc, netInfo)
 	}
 
 	fields := map[string]interface{}{
@@ -148,7 +171,7 @@ func (p *Procstat) Gather(acc telegraf.Accumulator) error {
 }
 
 // Add metrics a single Process
-func (p *Procstat) addMetric(proc Process, acc telegraf.Accumulator) {
+func (p *Procstat) addMetric(proc Process, acc telegraf.Accumulator, netInfo NetworkInfo) {
 	var prefix string
 	if p.Prefix != "" {
 		prefix = p.Prefix + "_"
@@ -224,23 +247,23 @@ func (p *Procstat) addMetric(proc Process, acc telegraf.Accumulator) {
 		fields[prefix+"created_at"] = createdAt * 1000000 //Convert ms to ns
 	}
 
-	cpu_time, err := proc.Times()
+	cpuTime, err := proc.Times()
 	if err == nil {
-		fields[prefix+"cpu_time_user"] = cpu_time.User
-		fields[prefix+"cpu_time_system"] = cpu_time.System
-		fields[prefix+"cpu_time_idle"] = cpu_time.Idle
-		fields[prefix+"cpu_time_nice"] = cpu_time.Nice
-		fields[prefix+"cpu_time_iowait"] = cpu_time.Iowait
-		fields[prefix+"cpu_time_irq"] = cpu_time.Irq
-		fields[prefix+"cpu_time_soft_irq"] = cpu_time.Softirq
-		fields[prefix+"cpu_time_steal"] = cpu_time.Steal
-		fields[prefix+"cpu_time_guest"] = cpu_time.Guest
-		fields[prefix+"cpu_time_guest_nice"] = cpu_time.GuestNice
+		fields[prefix+"cpu_time_user"] = cpuTime.User
+		fields[prefix+"cpu_time_system"] = cpuTime.System
+		fields[prefix+"cpu_time_idle"] = cpuTime.Idle
+		fields[prefix+"cpu_time_nice"] = cpuTime.Nice
+		fields[prefix+"cpu_time_iowait"] = cpuTime.Iowait
+		fields[prefix+"cpu_time_irq"] = cpuTime.Irq
+		fields[prefix+"cpu_time_soft_irq"] = cpuTime.Softirq
+		fields[prefix+"cpu_time_steal"] = cpuTime.Steal
+		fields[prefix+"cpu_time_guest"] = cpuTime.Guest
+		fields[prefix+"cpu_time_guest_nice"] = cpuTime.GuestNice
 	}
 
-	cpu_perc, err := proc.Percent(time.Duration(0))
+	cpuPerc, err := proc.Percent(time.Duration(0))
 	if err == nil {
-		fields[prefix+"cpu_usage"] = cpu_perc
+		fields[prefix+"cpu_usage"] = cpuPerc
 	}
 
 	mem, err := proc.MemoryInfo()
@@ -253,9 +276,9 @@ func (p *Procstat) addMetric(proc Process, acc telegraf.Accumulator) {
 		fields[prefix+"memory_locked"] = mem.Locked
 	}
 
-	mem_perc, err := proc.MemoryPercent()
+	memPerc, err := proc.MemoryPercent()
 	if err == nil {
-		fields[prefix+"memory_usage"] = mem_perc
+		fields[prefix+"memory_usage"] = memPerc
 	}
 
 	rlims, err := proc.RlimitUsage(true)
@@ -297,7 +320,121 @@ func (p *Procstat) addMetric(proc Process, acc telegraf.Accumulator) {
 		}
 	}
 
+	pidConnections, err := netInfo.GetConnectionsByPid(uint32(proc.PID()))
+	if err == nil {
+		counts := make(map[linux.TCPState]int)
+		for _, netcon := range pidConnections {
+			counts[netcon.state]++
+		}
+
+		for state, num := range counts {
+			stateName := strings.ReplaceAll(strings.ToLower(state.String()), "-", "_")
+			fields[prefix+stateName] = num
+		}
+	} else {
+		// Ignore errors because pid was not found. It is normal to have procs without connections
+		if !errors.Is(err, ErrorPIDNotFound) {
+			acc.AddError(fmt.Errorf("D! [inputs.procstat] not able to get connections for pid=%v: %v", proc.PID(), err))
+		}
+	}
+
+	// add measurement procstat_tcp with tcp listeners and connections for each proccess
+	err = addConnectionEnpoints(acc, proc, netInfo)
+	if err != nil {
+		acc.AddError(fmt.Errorf("D! [inputs.procstat] not able to generate network metrics for pid=%v: %v", proc.PID(), err))
+	}
+
 	acc.AddFields("procstat", fields, proc.Tags())
+}
+
+// addConnectionEnpoints add listen and connection endpoints to the metric
+// If listen is in the 0.0.0.0 or :: addresses, it will be added one value for each of the IP addresses of the host
+// Listeners in private IPs are ignored, we want info about hosts with others hosts
+// Connections made to this server are ignored (where the local port is one of the listening ports)
+// Do not generate any metric if pid does not have network info or it is in a different network namespace
+func addConnectionEnpoints(acc telegraf.Accumulator, proc Process, netInfo NetworkInfo) error {
+	TCPListen := map[string]interface{}{}
+	TCPConn := map[string]interface{}{}
+
+	pidConnections, err := netInfo.GetConnectionsByPid(uint32(proc.PID()))
+	if err != nil {
+		// If we have not connections for that pid or it is in another net ns, do not generate any metric
+		if errors.Is(err, ErrorPIDNotFound) {
+			return nil
+		}
+
+		return fmt.Errorf("W! [inputs.procstat] not able to get connections for pid=%v: %v", proc.PID(), err)
+	}
+
+	// In case of error, ppid=0 and will be ignored in IsPidListeningInPort
+	ppid, _ := proc.Ppid()
+
+	for _, c := range pidConnections {
+		// Ignore listeners or connections in/to localhost or private IPs
+		if c.srcIP.IsLoopback() || containsIP(netInfo.GetPrivateIPs(), c.srcIP) {
+			continue
+		}
+
+		if c.state == linux.TCP_LISTEN {
+			if netInfo.IsPidListeningInAddr(uint32(ppid), c.srcIP, c.srcPort) {
+				continue
+			}
+
+			if c.srcIP.IsUnspecified() {
+				// 0.0.0.0 listen in all IPv4 addresses
+				// :: listen in all IPv4 + IPv6 addresses
+				for _, ip := range netInfo.GetPublicIPs() {
+					if isIPV4(ip) || isIPV6(c.srcIP) {
+						TCPListen[endpointString(ip, c.srcPort)] = nil
+					}
+				}
+			} else {
+				TCPListen[endpointString(c.srcIP, c.srcPort)] = nil
+			}
+		} else if c.state != linux.TCP_SYN_SENT { // All TCP states except LISTEN (already processed) and SYN_SENT imply a connection between the hosts
+			// Ignore connections from outside hosts to listeners in this host (status != LISTEN and localPort in listenPorts)
+			if !netInfo.IsAListenPort(c.srcPort) {
+				TCPConn[endpointString(c.dstIP, c.dstPort)] = nil
+			}
+		}
+	}
+
+	// Only add metrics if we have data
+	if len(TCPConn) > 0 || len(TCPListen) > 0 {
+		tcpConnections := []string{}
+		tcpListeners := []string{}
+
+		for k := range TCPConn {
+			tcpConnections = append(tcpConnections, k)
+		}
+		sort.Strings(tcpConnections) // sort to make testing simplier
+
+		for k := range TCPListen {
+			tcpListeners = append(tcpListeners, k)
+		}
+		sort.Strings(tcpListeners)
+
+		fields := map[string]interface{}{
+			TCPConnectionKey: strings.Join(tcpConnections, ","),
+			TCPListenKey:     strings.Join(tcpListeners, ","),
+		}
+
+		acc.AddFields(MetricNameTCPConnections, fields, proc.Tags())
+	}
+
+	return nil
+}
+
+// appendIPs extract and return IPs from addresses
+func extractIPs(addreses []net.Addr) (ret []net.IP, err error) {
+	for _, a := range addreses {
+		ip, _, err := net.ParseCIDR(a.String())
+		if err != nil {
+			return nil, fmt.Errorf("parsing interface address: %v", err)
+		}
+		ret = append(ret, ip)
+	}
+	return ret, nil
 }
 
 // Update monitored Processes
@@ -459,6 +596,31 @@ func (p *Procstat) winServicePIDs() ([]PID, error) {
 	pids = append(pids, PID(pid))
 
 	return pids, nil
+}
+
+func containsIP(a []net.IP, x net.IP) bool {
+	for _, n := range a {
+		if x.Equal(n) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIPV4(ip net.IP) bool {
+	return ip.To4() != nil
+}
+
+func isIPV6(ip net.IP) bool {
+	return ip.To4() == nil
+}
+
+// endpointString return the correct representation of ip and port for IPv4 and IPv6
+func endpointString(ip net.IP, port uint32) string {
+	if isIPV6(ip) {
+		return fmt.Sprintf("[%s]:%d", ip, port)
+	}
+	return fmt.Sprintf("%s:%d", ip, port)
 }
 
 func init() {
